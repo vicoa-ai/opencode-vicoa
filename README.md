@@ -75,7 +75,7 @@ npm run build
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": ["file://<path/to/opencode-vicoa>"]
+  "plugins": ["file://<path/to/opencode-vicoa/dist/index.js>"]
 }
 ```
 

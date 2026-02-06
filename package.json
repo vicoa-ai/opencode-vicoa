@@ -1,6 +1,6 @@
 {
   "name": "@vicoa/opencode",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OpenCode plugin for using OpenCode anywhere, on any device with Vicoa",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -34,6 +34,7 @@
   ],
   "author": "Vicoa",
   "license": "Apache-2.0",
+  "homepage": "https://vicoa.ai",
   "repository": {
     "type": "git",
     "url": "https://github.com/vicoa-ai/opencode-vicoa.git"
