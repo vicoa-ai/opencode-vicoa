@@ -8,6 +8,7 @@ type ControlCommandContext = {
   client: any;
   vicoaClient: VicoaClient;
   currentSessionId?: string;
+  currentSessionStatus?: 'idle' | 'busy' | 'retry';
   getTuiCurrentAgent: () => string | undefined;
   setTuiCurrentAgent: (agent: string | undefined) => void;
   setPreferredAgent: (agent: string | undefined) => void;
@@ -83,7 +84,7 @@ function extractControlPayload(content: string): { setting?: string; value?: unk
  * Handle control commands from Vicoa (matching Claude wrapper pattern)
  */
 export async function handleControlCommand(content: string, context: ControlCommandContext): Promise<boolean> {
-  const { client, vicoaClient, currentSessionId, getTuiCurrentAgent, setPreferredAgent, setTuiCurrentAgent } = context;
+  const { client, vicoaClient, currentSessionId, currentSessionStatus, getTuiCurrentAgent, setPreferredAgent, setTuiCurrentAgent } = context;
 
   // Try to parse as JSON control command
   try {
@@ -98,6 +99,13 @@ export async function handleControlCommand(content: string, context: ControlComm
         if (!currentSessionId) {
           await vicoaClient.sendMessage('Failed to interrupt');
           log(client, 'warn', '[Vicoa] Interrupt failed: no active session');
+          return true;
+        }
+
+        // Check if OpenCode is idle
+        if (currentSessionStatus === 'idle') {
+          await vicoaClient.sendMessage('OpenCode is idle.');
+          log(client, 'info', '[Vicoa] OpenCode is already idle, no interrupt needed');
           return true;
         }
 

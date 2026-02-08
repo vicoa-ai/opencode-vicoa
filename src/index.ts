@@ -51,6 +51,9 @@ let preferredAgent: string | undefined;
 // steps are needed to land on a target agent.
 let tuiCurrentAgent: string | undefined;
 
+// Track current session status to detect if OpenCode is idle
+let currentSessionStatus: 'idle' | 'busy' | 'retry' | undefined;
+
 // Track messages that came from the UI (to avoid sending them back)
 // Keep a simple FIFO buffer of message content
 const messagesFromUI: string[] = [];
@@ -337,6 +340,7 @@ export const VicoaPlugin: Plugin = async (context) => {
           client,
           vicoaClient,
           currentSessionId,
+          currentSessionStatus,
           getTuiCurrentAgent: () => tuiCurrentAgent,
           setTuiCurrentAgent: (agent) => {
             tuiCurrentAgent = agent;
@@ -383,6 +387,8 @@ export const VicoaPlugin: Plugin = async (context) => {
           vicoaClient
         )
       ) {
+        // After processing a slash command, set status to AWAITING_INPUT
+        await vicoaClient.updateStatus('AWAITING_INPUT');
         return;
       }
 
@@ -511,6 +517,9 @@ export const VicoaPlugin: Plugin = async (context) => {
           
           case 'session.status': {
             const statusType = event.properties.status.type;
+
+            // Track current status for interrupt handling
+            currentSessionStatus = statusType;
 
             if (statusType === 'busy' || statusType === 'retry') {
               await vicoaClient.updateStatus('ACTIVE');

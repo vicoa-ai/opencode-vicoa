@@ -33,3 +33,5 @@ next-env.d.ts
 postgres_data/
 .env*.local
 *.tgz
+
+.claude/
