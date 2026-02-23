@@ -197,24 +197,27 @@ export async function scanOpencodeCommands(
 ): Promise<OpencodeCommandMap> {
   const commands: OpencodeCommandMap = {};
   const roots = getOpencodeCommandRoots(projectDir, homeDir);
+  const commandDirs = ['command', 'commands'];
 
   for (const root of roots) {
-    const commandRoot = path.join(root, 'commands');
-    const files = await walkMarkdownFiles(commandRoot);
-    for (const filePath of files) {
-      const relativePath = path.relative(commandRoot, filePath);
-      const normalized = relativePath.split(path.sep).join('/');
-      const commandName = normalized.replace(/\.md$/i, '');
-      if (!commandName) {
-        continue;
-      }
+    for (const commandDir of commandDirs) {
+      const commandRoot = path.join(root, commandDir);
+      const files = await walkMarkdownFiles(commandRoot);
+      for (const filePath of files) {
+        const relativePath = path.relative(commandRoot, filePath);
+        const normalized = relativePath.split(path.sep).join('/');
+        const commandName = normalized.replace(/\.md$/i, '');
+        if (!commandName) {
+          continue;
+        }
 
-      try {
-        const content = await fs.readFile(filePath, 'utf-8');
-        const description = parseCommandDescription(content, commandName);
-        commands[commandName] = { description };
-      } catch {
-        continue;
+        try {
+          const content = await fs.readFile(filePath, 'utf-8');
+          const description = parseCommandDescription(content, commandName);
+          commands[commandName] = { description };
+        } catch {
+          continue;
+        }
       }
     }
   }

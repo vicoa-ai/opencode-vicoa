@@ -35,3 +35,4 @@ postgres_data/
 *.tgz
 
 .claude/
+.opencode/
