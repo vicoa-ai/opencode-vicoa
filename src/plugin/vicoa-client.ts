@@ -21,21 +21,63 @@ export interface VicoaMessage {
   created_at: string;
 }
 
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+
+  return parsed;
+}
+
 export class VicoaClient {
   private config: VicoaClientConfig;
   public lastMessageId: string | null = null;
   private log: (level: string, msg: string) => void;
+  private requestTimeoutMs: number;
+  private pollTimeoutMs: number;
 
   constructor(config: VicoaClientConfig) {
     this.config = config;
     this.log = config.logFunc || ((level, msg) => console.log(`[${level}] ${msg}`));
+    this.requestTimeoutMs = parsePositiveInt(process.env.VICOA_HTTP_TIMEOUT_MS, 10000);
+    this.pollTimeoutMs = parsePositiveInt(process.env.VICOA_POLL_TIMEOUT_MS, 5000);
+  }
+
+  private async fetchWithTimeout(
+    url: string,
+    init: RequestInit,
+    timeoutMs: number = this.requestTimeoutMs
+  ): Promise<Response> {
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => {
+      controller.abort();
+    }, timeoutMs);
+
+    try {
+      return await fetch(url, {
+        ...init,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error(`Request timed out after ${timeoutMs}ms`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
   }
 
   /**
    * Register agent instance with Vicoa backend
    */
   async registerAgentInstance(project: string, homeDir: string): Promise<{ agent_instance_id: string }> {
-    const response = await fetch(`${this.config.baseUrl}/api/v1/agent-instances`, {
+    const response = await this.fetchWithTimeout(`${this.config.baseUrl}/api/v1/agent-instances`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${this.config.apiKey}`,
@@ -67,7 +109,7 @@ export class VicoaClient {
     commands: Record<string, { description: string }>
   ): Promise<void> {
     try {
-      const response = await fetch(`${this.config.baseUrl}/api/v1/commands/sync`, {
+      const response = await this.fetchWithTimeout(`${this.config.baseUrl}/api/v1/commands/sync`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${this.config.apiKey}`,
@@ -93,7 +135,7 @@ export class VicoaClient {
    */
   async sendMessage(content: string, requiresUserInput: boolean = false): Promise<string | null> {
     try {
-      const response = await fetch(`${this.config.baseUrl}/api/v1/messages/agent`, {
+      const response = await this.fetchWithTimeout(`${this.config.baseUrl}/api/v1/messages/agent`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${this.config.apiKey}`,
@@ -138,7 +180,7 @@ export class VicoaClient {
    */
   async sendUserMessage(content: string): Promise<string | null> {
     try {
-      const response = await fetch(`${this.config.baseUrl}/api/v1/messages/user`, {
+      const response = await this.fetchWithTimeout(`${this.config.baseUrl}/api/v1/messages/user`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${this.config.apiKey}`,
@@ -184,12 +226,12 @@ export class VicoaClient {
         url.searchParams.set('last_read_message_id', this.lastMessageId);
       }
 
-      const response = await fetch(url.toString(), {
+      const response = await this.fetchWithTimeout(url.toString(), {
         method: 'GET',
         headers: {
           'Authorization': `Bearer ${this.config.apiKey}`,
         },
-      });
+      }, this.pollTimeoutMs);
 
       if (!response.ok) {
         // Polling errors are non-fatal
@@ -229,7 +271,7 @@ export class VicoaClient {
    */
   async requestUserInput(messageId: string): Promise<void> {
     try {
-      const response = await fetch(
+      const response = await this.fetchWithTimeout(
         `${this.config.baseUrl}/api/v1/messages/${messageId}/request-input`,
         {
           method: 'PATCH',
@@ -263,7 +305,7 @@ export class VicoaClient {
       | 'DELETED'
   ): Promise<void> {
     try {
-      const response = await fetch(
+      const response = await this.fetchWithTimeout(
         `${this.config.baseUrl}/api/v1/agent-instances/${this.config.agentInstanceId}/status`,
         {
           method: 'PUT',
@@ -288,7 +330,7 @@ export class VicoaClient {
    */
   async updateAgentInstanceName(name: string): Promise<void> {
     try {
-      const response = await fetch(
+      const response = await this.fetchWithTimeout(
         `${this.config.baseUrl}/api/v1/agent-instances/${this.config.agentInstanceId}`,
         {
           method: 'PATCH',
@@ -315,7 +357,7 @@ export class VicoaClient {
     await this.updateStatus('COMPLETED');
 
     try {
-      const response = await fetch(
+      const response = await this.fetchWithTimeout(
         `${this.config.baseUrl}/api/v1/sessions/end`,
         {
           method: 'POST',

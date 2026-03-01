@@ -269,6 +269,34 @@ async function sendAgentSwitchToUi(
   logClient('info', `[Vicoa] Forwarded terminal agent change to UI: ${agentName}`);
 }
 
+function startCommandSyncSubprogress(
+  vicoaClient: VicoaClient,
+  projectPath: string,
+  homeDir: string,
+  logClient: (level: 'debug' | 'info' | 'warn' | 'error', message: string) => void,
+): void {
+  // Run sync on a separate tick so plugin startup and poller wiring never wait
+  // for command scan/sync work to even begin.
+  setTimeout(() => {
+    void (async () => {
+      logClient('debug', '[Vicoa] [subprogress] Starting slash command sync');
+      try {
+        const opencodeCommands = await scanOpencodeCommands(projectPath, homeDir);
+        const count = Object.keys(opencodeCommands).length;
+        if (count === 0) {
+          logClient('debug', '[Vicoa] [subprogress] No slash commands to sync');
+          return;
+        }
+
+        await vicoaClient.syncCommands(OPENCODE_SLASH_AGENT_TYPE, opencodeCommands);
+        logClient('info', `[Vicoa] Synced ${count} OpenCode slash commands`);
+      } catch (error) {
+        logClient('warn', `[Vicoa] Failed to sync OpenCode slash commands: ${error}`);
+      }
+    })();
+  }, 0);
+}
+
 export const VicoaPlugin: Plugin = async (context) => {
   const { client, directory } = context;
 
@@ -310,19 +338,16 @@ export const VicoaPlugin: Plugin = async (context) => {
     await vicoaClient.registerAgentInstance(formattedProjectPath, homeDir);
     log(client, "info", `[Vicoa] Registered session: ${agentInstanceId}`);
 
-    // Send initial message
-    await vicoaClient.sendMessage('OpenCode session started, waiting for your input...');
+    // Non-critical startup work runs in background to reduce startup latency.
+    void vicoaClient
+      .sendMessage('OpenCode session started, waiting for your input...')
+      .catch((error) => {
+        log(client, "warn", `[Vicoa] Failed to send startup message: ${error}`);
+      });
 
-    try {
-      const opencodeCommands = await scanOpencodeCommands(projectPath, homeDir);
-      const count = Object.keys(opencodeCommands).length;
-      if (count > 0) {
-        await vicoaClient.syncCommands(OPENCODE_SLASH_AGENT_TYPE, opencodeCommands);
-        log(client, "info", `[Vicoa] Synced ${count} OpenCode slash commands`);
-      }
-    } catch (error) {
-      log(client, "warn", `[Vicoa] Failed to sync OpenCode slash commands: ${error}`);
-    }
+    startCommandSyncSubprogress(vicoaClient, projectPath, homeDir, (level, message) =>
+      log(client, level, message)
+    );
   } catch (error) {
     log(client, "error", `[Vicoa] Failed to register: ${error}`);
     return {};

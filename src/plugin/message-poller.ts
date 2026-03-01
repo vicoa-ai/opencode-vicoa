@@ -9,6 +9,7 @@ import type { VicoaClient } from './vicoa-client.js';
 export class MessagePoller {
   private client: VicoaClient;
   private interval: NodeJS.Timeout | null = null;
+  private pollingInProgress: boolean = false;
   private pollIntervalMs: number;
   private onMessage: (content: string) => Promise<void>;
   private log: (level: string, msg: string) => void;
@@ -33,6 +34,11 @@ export class MessagePoller {
     this.log('info', 'Starting message poller');
 
     this.interval = setInterval(async () => {
+      if (this.pollingInProgress) {
+        return;
+      }
+
+      this.pollingInProgress = true;
       try {
         const messages = await this.client.getPendingMessages();
 
@@ -44,6 +50,8 @@ export class MessagePoller {
         }
       } catch (error) {
         this.log('warn', `Error polling messages: ${error}`);
+      } finally {
+        this.pollingInProgress = false;
       }
     }, this.pollIntervalMs);
   }
@@ -52,6 +60,7 @@ export class MessagePoller {
     if (this.interval) {
       clearInterval(this.interval);
       this.interval = null;
+      this.pollingInProgress = false;
       this.log('info', 'Stopped message poller');
     }
   }
