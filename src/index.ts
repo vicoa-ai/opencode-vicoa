@@ -302,7 +302,7 @@ export const VicoaPlugin: Plugin = async (context) => {
 
   // Get API key from environment or credentials file
   const apiKey = getApiKey();
-  const baseUrl = process.env.VICOA_API_URL || process.env.VICOA_BASE_URL || 'https://api.vicoa.ai:8443';
+  const baseUrl = process.env.VICOA_API_URL || process.env.VICOA_BASE_URL || 'https://agents.vicoa.ai';
 
   if (!apiKey) {
     log(client, 'warn', `[Vicoa v${PLUGIN_VERSION}] Disabled: No API key found`);
