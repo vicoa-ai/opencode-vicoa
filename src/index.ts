@@ -563,7 +563,63 @@ export const VicoaPlugin: Plugin = async (context) => {
 
   sessionWsClient.start();
 
+  // ── session finalization ────────────────────────────────────────────────
+  // Mark the instance COMPLETED and tear down the WebSocket exactly once, no
+  // matter which shutdown path fires first. OpenCode can end a session several
+  // ways and they do not all reach the plugin the same way:
+  //   - the `dispose` plugin hook and the `*.disposed` events cover a graceful
+  //     exit (/exit, the app quitting),
+  //   - but a signal (Ctrl+C = SIGINT, `kill` = SIGTERM) tears the process down
+  //     without delivering either, which is why the status used to stay ACTIVE
+  //     after Ctrl+C. The process handlers below are the backstop for that.
+  // endSession is idempotent server-side, so racing paths are safe.
+  //
+  // Cap the shutdown wait so a stalled backend can't make Ctrl+C hang.
+  // endSession is best-effort: if the write can't land in this window, exit
+  // anyway rather than block the user.
+  const SHUTDOWN_FINALIZE_TIMEOUT_MS = 3000;
+  let finalized = false;
+  async function finalizeSession(reason: string): Promise<void> {
+    if (finalized) return;
+    finalized = true;
+    log(client, 'info', `[Vicoa] Finalizing session (${reason})`);
+    sessionWsClient.stop();
+    try {
+      await Promise.race([
+        vicoaClient.endSession(),
+        new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_FINALIZE_TIMEOUT_MS)),
+      ]);
+    } catch (error) {
+      log(client, 'warn', `[Vicoa] endSession during ${reason} failed: ${error}`);
+    }
+  }
+
+  // Signal backstop for the Ctrl+C / kill path. The plugin runs inside the
+  // OpenCode process, so these handlers are additive to OpenCode's own — Node
+  // runs every listener. We do NOT call process.exit(): OpenCode owns the exit,
+  // and forcing it here would cut off its own teardown. We only fire the
+  // COMPLETED write and let the normal exit proceed. Adding a listener does
+  // suppress Node's default "exit immediately on signal", but OpenCode installs
+  // its own signal handling that drives the real shutdown, so the process still
+  // exits; endSession is a sub-second REST call with its own timeout, so it
+  // does not meaningfully delay it.
+  const onSignal = (signal: NodeJS.Signals) => {
+    void finalizeSession(signal);
+  };
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
+  process.once('SIGHUP', onSignal);
+  // `beforeExit` fires on a natural event-loop drain (not on signals or
+  // process.exit), a final safety net if the process winds down without any of
+  // the above. It can run async work, unlike `exit`.
+  process.once('beforeExit', () => {
+    void finalizeSession('beforeExit');
+  });
+
   return {
+    dispose: async () => {
+      await finalizeSession('dispose');
+    },
     event: async ({ event }) => {
       try {
         switch (event.type) {
@@ -798,18 +854,12 @@ export const VicoaPlugin: Plugin = async (context) => {
           }
 
           // ── shutdown ──────────────────────────────────────────────
-          // Fires before the process exits (/exit, app.exit, etc.).
-          // This is the only path where the event loop is still live,
-          // so async endSession() can actually complete.
+          // The graceful-exit events (/exit, app quitting). Signal-based
+          // teardown (Ctrl+C) does not emit these — the process signal
+          // handlers above cover that. finalizeSession dedupes across them.
           case 'server.instance.disposed' as string:
           case 'global.disposed' as string: {
-            log(client, 'info', `[Vicoa] ${event.type} — ending session`);
-            sessionWsClient.stop();
-            try {
-              await vicoaClient.endSession();
-            } catch (error) {
-              log(client, 'warn', `[Vicoa] endSession during dispose failed: ${error}`);
-            }
+            await finalizeSession(event.type);
             return;
           }
 
