@@ -1,8 +1,8 @@
 /**
  * Path utilities for normalizing project paths
  *
- * Matches the behavior of Python's vicoa.utils.get_project_path()
- * to ensure consistent path representation across agents.
+ * Replaces the home-directory prefix with ~ for a consistent path
+ * representation across agents.
  */
 
 import * as os from 'os';

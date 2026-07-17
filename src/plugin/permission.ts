@@ -105,8 +105,8 @@ export function formatPermissionRequest(permission: Permission, options: Permiss
     message += `\n\n${meta.description}`;
   }
 
-  // Format options in the same [OPTIONS] envelope the Python wrapper uses,
-  // so the Vicoa UI renders them as actionable buttons/choices.
+  // Format options in the [OPTIONS] envelope the Vicoa UI expects, so it
+  // renders them as actionable buttons/choices.
   const optionLines = options.map((opt, i) => `${i + 1}. ${opt.label}`);
   message += `\n\n[OPTIONS]\n${optionLines.join('\n')}\n[/OPTIONS]`;
 

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is an OpenCode plugin that integrates with Vicoa (a mobile/web platform for managing AI coding agents). The plugin enables bidirectional communication between OpenCode sessions and the Vicoa dashboard, allowing users to monitor OpenCode progress, send messages, approve permissions, and execute commands from their phone or browser.
 
-**Key Architecture**: This plugin runs INSIDE OpenCode (not as a separate wrapper) and directly calls Vicoa REST APIs. It eliminates the need for external Python processes by implementing everything in TypeScript.
+**Key Architecture**: This plugin runs INSIDE OpenCode (not as a separate wrapper) and directly calls Vicoa REST APIs. It eliminates the need for a separate external wrapper process by implementing everything in TypeScript.
 
 ## Development Commands
 
@@ -45,8 +45,8 @@ To test local changes with OpenCode:
 
 The plugin is organized into focused modules in `src/plugin/`:
 
-- **vicoa-client.ts**: HTTP client for Vicoa REST APIs (register agent, send/receive messages, sync commands, update status)
-- **message-poller.ts**: Polls Vicoa backend every 1s for user messages from the dashboard
+- **vicoa-client.ts**: HTTP client for Vicoa REST APIs (register agent, send messages, sync commands, update status)
+- **session-ws-client.ts**: Session-scoped WebSocket to `/ws` delivering user messages from the dashboard. Replaced the 1 Hz REST poller
 - **commands.ts**: Handles slash commands from Vicoa (maps user commands like `/sessions` to OpenCode TUI actions)
 - **control.ts**: Processes control commands (interrupt, agent switching) sent from Vicoa dashboard
 - **permission.ts**: Formats permission requests for Vicoa UI and parses user responses back to OpenCode
@@ -57,22 +57,31 @@ The plugin is organized into focused modules in `src/plugin/`:
 
 ### Plugin Lifecycle
 
-1. **Initialization** (src/index.ts:269-326):
+1. **Initialization**:
    - Loads Vicoa API key from credentials or environment
    - Registers agent instance with Vicoa backend
    - Syncs OpenCode slash commands to Vicoa dashboard
-   - Starts message poller for bidirectional communication
+   - Connects the session WebSocket for bidirectional communication
 
-2. **Event Handling** (src/index.ts:400+):
+2. **Event Handling**:
    - Listens to OpenCode SDK events (user messages, assistant messages, tool usage, permissions)
    - Forwards relevant events to Vicoa dashboard
    - Tracks message state incrementally to avoid duplicates
    - Handles permission requests by forwarding to Vicoa and waiting for user approval
 
 3. **Message Flow**:
-   - **OpenCode → Vicoa**: Assistant messages, tool usage, permission requests sent via `vicoaClient.sendMessage()`
-   - **Vicoa → OpenCode**: User prompts received via `messagePoller`, injected using `client.user.message()` API
+   - **OpenCode → Vicoa**: Assistant messages, tool usage, permission requests sent via `vicoaClient.sendMessage()` (REST)
+   - **Vicoa → OpenCode**: User prompts arrive on the session WebSocket and are submitted to the TUI. Only this direction moved off REST
    - **Deduplication**: Tracks messages from UI (`messagesFromUI` buffer) to avoid echo loops
+
+### Agent Instance Status
+
+`instance.status` is the label the app shows: ACTIVE while a turn runs, AWAITING_INPUT once it returns. Two things make this easy to get wrong:
+
+- **Writing a message is a status change.** `POST /messages/agent` sets the row to ACTIVE server-side (or AWAITING_INPUT when `requires_user_input`), and a user-message insert reactivates it. `VicoaClient` mirrors this in `knownStatus` so it can skip no-op writes without going stale.
+- **`requires_user_input: true` fires push/email/SMS.** Use it only for genuine questions (e.g. permission requests). For acknowledging something the user just did from the app, post a plain message and set the status separately — see `settleAfterUserAction`.
+
+Subagents (the `task` tool) get their own child sessions whose `session.idle` / `session.status` events look identical to the main session's. They are filtered via `childSessionIds`; without that, a subagent finishing parks the instance on AWAITING_INPUT mid-turn.
 
 ### Key State Management
 
