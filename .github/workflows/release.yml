@@ -1,0 +1,100 @@
+name: Release
+
+# Bump `version` in package.json and merge to main. This workflow compares
+# that version against what's currently on npm; if it's newer, it builds,
+# tests, publishes to npm, and creates a matching git tag + GitHub Release.
+# If the version is unchanged, the run is a no-op.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - package.json
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # Must match the "Environment name" configured on npm's Trusted Publisher
+    # form. npm's OIDC check rejects the publish unless the job runs here.
+    environment: release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      # Trusted Publishing (OIDC) requires npm CLI >= 11.5.1. Node 22 ships
+      # npm 10.x, so upgrade before publishing.
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check version
+        id: version
+        run: |
+          LOCAL_VERSION=$(node -p "require('./package.json').version")
+          PUBLISHED_VERSION=$(npm view @vicoa/opencode version 2>/dev/null || echo "0.0.0")
+          echo "local=$LOCAL_VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$LOCAL_VERSION" = "$PUBLISHED_VERSION" ]; then
+            echo "Version $LOCAL_VERSION already published, skipping release."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Publishing new version $LOCAL_VERSION (currently published: $PUBLISHED_VERSION)."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Type check
+        if: steps.version.outputs.changed == 'true'
+        run: npm run type-check
+
+      - name: Test
+        if: steps.version.outputs.changed == 'true'
+        run: npm test --if-present
+
+      - name: Build
+        if: steps.version.outputs.changed == 'true'
+        run: npm run build
+
+      # Trusted Publishing: no NPM_TOKEN needed. Auth is via the OIDC token
+      # (id-token: write above), and provenance is generated automatically.
+      - name: Publish to npm
+        if: steps.version.outputs.changed == 'true'
+        run: npm publish
+
+      - name: Tag release
+        if: steps.version.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "v${{ steps.version.outputs.local }}"
+          git push origin "v${{ steps.version.outputs.local }}"
+
+      - name: Create GitHub release
+        if: steps.version.outputs.changed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.local }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
