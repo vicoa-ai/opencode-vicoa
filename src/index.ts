@@ -9,14 +9,15 @@
  * - Session state management
  *
  * This plugin runs INSIDE OpenCode and directly calls Vicoa REST APIs,
- * eliminating the need for a separate Python wrapper process.
+ * eliminating the need for a separate wrapper process.
  */
 
 import type { Plugin } from '@opencode-ai/plugin';
 import type { FilePart, Part, Permission, ReasoningPart, TextPart, ToolPart } from '@opencode-ai/sdk';
 import { VicoaClient } from './plugin/vicoa-client.js';
-import { MessagePoller } from './plugin/message-poller.js';
+import { SessionMessagesWsClient, deriveWsUrl } from './plugin/session-ws-client.js';
 import { getApiKey } from './plugin/credentials.js';
+import { readMachineId } from './plugin/machine-state.js';
 import { formatFilePart, formatReasoningPart, formatToolPart } from './plugin/format-utils.js';
 import {
   buildPermissionOptions,
@@ -37,9 +38,11 @@ import { log } from './plugin/utils.js';
 import { formatProjectPath } from './plugin/path-utils.js';
 
 /**
- * Plugin version - increment on changes
+ * Plugin version - keep in sync with package.json "version".
+ * Reported to the backend as the X-CLI-Version header on the session
+ * WebSocket, which gates SSE/poll-transport retirement telemetry.
  */
-const PLUGIN_VERSION = '0.1.0';
+const PLUGIN_VERSION = '0.2.0';
 
 let lastSessionTitle: string | null = null;
 let currentSessionId: string | undefined;
@@ -51,8 +54,95 @@ let preferredAgent: string | undefined;
 // steps are needed to land on a target agent.
 let tuiCurrentAgent: string | undefined;
 
+// The model slug ("providerID/modelID") last seen in a user message or set by
+// a control command.  Used to detect TUI-side model changes so we can PATCH
+// session_config without waiting for the next control command from the app.
+let currentTuiModel: string | undefined;
+
 // Track current session status to detect if OpenCode is idle
 let currentSessionStatus: 'idle' | 'busy' | 'retry' | undefined;
+
+// Sessions OpenCode spawned as children of the main one — the `task` tool
+// gives each subagent its own session, and their lifecycle events are
+// indistinguishable from the main session's except by id.
+//
+// They must not drive the Vicoa instance status: a subagent finishing emits
+// session.idle / session.status:idle while the main session is still mid-turn,
+// which would park the instance on AWAITING_INPUT (app shows "waiting for you"
+// while the agent is visibly working) until the next status event happened to
+// correct it. Only session.created/updated/deleted carry the Session object
+// with its `parentID`, so record the children there and filter the id-only
+// events against this set.
+const childSessionIds = new Set<string>();
+
+// The last agent message we flagged via requestUserInput. The endpoint 400s on
+// a re-flag (see VicoaClient.requestUserInput), and session.idle can fire more
+// than once for the same message — e.g. an interrupt lands with no new agent
+// output, or the session settles idle again after a no-op turn.
+let markedRequestInputId: string | null = null;
+
+// Debounces the turn-end transition to one write per idle period. OpenCode
+// signals the same settle twice (session.idle and session.status:idle) and the
+// two are not interchangeable: settleAwaitingInput prefers requestUserInput,
+// which deliberately leaves the instance ACTIVE when the user has typed ahead.
+// Without this, the second event's plain AWAITING_INPUT write would clobber
+// that decision. Reset when the session goes busy again.
+let idleSettled = false;
+
+function isChildSession(sessionId: string | undefined): boolean {
+  return sessionId !== undefined && childSessionIds.has(sessionId);
+}
+
+/**
+ * Settle the instance at the end of a turn — at most once per idle period.
+ *
+ * Flagging the last agent message is preferred over a plain status write: that
+ * path is queued-message aware server-side, so a user who typed ahead keeps the
+ * instance ACTIVE and gets no pointless "agent needs you" notification.
+ */
+async function settleAwaitingInput(vicoaClient: VicoaClient): Promise<void> {
+  if (idleSettled) return;
+  idleSettled = true;
+
+  const messageId = vicoaClient.lastAgentMessageId;
+  if (messageId && messageId !== markedRequestInputId) {
+    markedRequestInputId = messageId;
+    if (await vicoaClient.requestUserInput(messageId)) {
+      return;
+    }
+    // Flagging failed, so it left the status alone — fall through rather than
+    // leave the instance parked on ACTIVE with the turn already over. The
+    // sibling idle event cannot cover for us; idleSettled is already set.
+  }
+  // Nothing to flag (no agent output this turn, or already flagged) — just make
+  // sure the row is not left showing ACTIVE.
+  await vicoaClient.updateStatus('AWAITING_INPUT');
+}
+
+/** Mark the instance as working. Re-arms the turn-end settle. */
+async function markActive(vicoaClient: VicoaClient): Promise<void> {
+  idleSettled = false;
+  await vicoaClient.updateStatus('ACTIVE');
+}
+
+/**
+ * Settle after an action the user drove from the app (control or slash
+ * command), rather than after a model turn.
+ *
+ * Same AWAITING_INPUT destination, but deliberately via a plain status write:
+ * the acknowledgement we just posted is not something to notify anyone about,
+ * and the user is holding the phone they'd be pinged on. Marking the ack as
+ * already-flagged is what suppresses that notification — the session.idle that
+ * follows then finds nothing new to flag and settles quietly.
+ *
+ * Note this does NOT claim `idleSettled`. These commands can arrive mid-turn
+ * (changing the model while the agent works), and swallowing that turn's real
+ * settle would leave the instance stuck ACTIVE after it finished.
+ */
+async function settleAfterUserAction(vicoaClient: VicoaClient): Promise<void> {
+  markedRequestInputId = vicoaClient.lastAgentMessageId;
+  await vicoaClient.updateStatus('AWAITING_INPUT');
+}
 
 // Track messages that came from the UI (to avoid sending them back)
 // Keep a simple FIFO buffer of message content
@@ -333,18 +423,36 @@ export const VicoaPlugin: Plugin = async (context) => {
     const projectPath = directory || process.cwd();
     const homeDir = os.homedir();
 
-    // Format project path to use ~ for home directory (consistent with Claude wrapper)
+    // Format project path to use ~ for the home directory.
     const formattedProjectPath = formatProjectPath(projectPath);
-    await vicoaClient.registerAgentInstance(formattedProjectPath, homeDir);
+
+    // Link the session to the local machine so the app can route file/git RPCs
+    // (list-files, git-diff, git-status) to its daemon — without this the app's
+    // "files and changes" view has no machine to address and comes back empty.
+    // Read from the daemon state file; null when no daemon is registered here,
+    // in which case there is nothing to serve those RPCs anyway.
+    const machineId = readMachineId(baseUrl);
+    if (machineId) {
+      log(client, 'info', `[Vicoa] Linking session to machine ${machineId}`);
+    } else {
+      log(client, 'debug', '[Vicoa] No local daemon machine_id; session will be unlinked (files/changes unavailable)');
+    }
+
+    await vicoaClient.registerAgentInstance(formattedProjectPath, homeDir, machineId);
     log(client, "info", `[Vicoa] Registered session: ${agentInstanceId}`);
 
-    // Non-critical startup work runs in background to reduce startup latency.
-    void vicoaClient
-      .sendMessage('OpenCode session started, waiting for your input...')
-      .catch((error) => {
-        log(client, "warn", `[Vicoa] Failed to send startup message: ${error}`);
-      });
-
+    // No synthetic "OpenCode session started, waiting for your input..."
+    // message: the user just launched the TUI themselves and is sitting in
+    // front of it, so a placeholder agent row only clutters the chat list.
+    //
+    // That message did carry a side effect worth naming, since nothing else
+    // replaces it: posting an agent message advances the instance's
+    // last_read_message_id server-side, which is the cursor the catch-up fetch
+    // falls back to when the client has no watermark of its own. Sending it on
+    // every launch therefore discarded any backlog. Without it, a session
+    // resumed onto the same instance id (reused via VICOA_AGENT_INSTANCE_ID)
+    // now replays the user messages sent while it was gone — the reason the WS
+    // client delivers them one at a time.
     startCommandSyncSubprogress(vicoaClient, projectPath, homeDir, (level, message) =>
       log(client, level, message)
     );
@@ -353,13 +461,28 @@ export const VicoaPlugin: Plugin = async (context) => {
     return {};
   }
 
-  // Start polling for user messages
-  const messagePoller = new MessagePoller(
-    vicoaClient,
-    async (userMessage) => {
+  // Receive user messages over the session-scoped WebSocket. URL is derived
+  // from the REST base_url unless VICOA_WS_URL overrides it.
+  const wsUrl = process.env.VICOA_WS_URL || deriveWsUrl(baseUrl);
+  const sessionWsClient = new SessionMessagesWsClient({
+    wsUrl,
+    apiKey,
+    instanceId: agentInstanceId,
+    cliVersion: PLUGIN_VERSION,
+    log: (level: string, msg: string) =>
+      log(client, (level as 'debug' | 'info' | 'warn' | 'error') || 'info', `[Vicoa] ${msg}`),
+    onAuthFailure: (reason) => {
+      // The client has stopped and will not reconnect: the credential is gone,
+      // not flaky. Say so once — the dashboard link is dead for this session
+      // and re-authenticating means restarting OpenCode.
+      log(client, 'error',
+        `[Vicoa] Dashboard connection closed — credential rejected (${reason}). ` +
+        'Re-authenticate with "vicoa --auth" and restart OpenCode.');
+    },
+    onUserMessage: async (userMessage) => {
       log(client, "info", `[Vicoa] Received message from dashboard: ${userMessage.substring(0, 80)}${userMessage.length > 80 ? '...' : ''}`);
 
-      // Check if it's a control command (matches Claude wrapper pattern)
+      // Check if it's a control command
       if (
         await handleControlCommand(userMessage, {
           client,
@@ -373,9 +496,12 @@ export const VicoaPlugin: Plugin = async (context) => {
           setPreferredAgent: (agent) => {
             preferredAgent = agent;
           },
+          setTuiCurrentModel: (model) => {
+            currentTuiModel = model;
+          },
         })
       ) {
-        await vicoaClient.updateStatus('AWAITING_INPUT');
+        await settleAfterUserAction(vicoaClient);
         return; // Control command handled
       }
 
@@ -412,8 +538,10 @@ export const VicoaPlugin: Plugin = async (context) => {
           vicoaClient
         )
       ) {
-        // After processing a slash command, set status to AWAITING_INPUT
-        await vicoaClient.updateStatus('AWAITING_INPUT');
+        // After processing a slash command, settle back to AWAITING_INPUT.
+        // If the command kicked off real work, the session.status:busy that
+        // follows re-arms the normal turn-end handling.
+        await settleAfterUserAction(vicoaClient);
         return;
       }
 
@@ -431,12 +559,67 @@ export const VicoaPlugin: Plugin = async (context) => {
       await client.tui.submitPrompt();
       log(client, "info", `[Vicoa] Executed prompt in OpenCode: ${userMessage.substring(0, 80)}...`);
     },
-    (level: string, msg: string) => log(client, "info", msg)
-  );
+  });
 
-  messagePoller.start();
+  sessionWsClient.start();
+
+  // ── session finalization ────────────────────────────────────────────────
+  // Mark the instance COMPLETED and tear down the WebSocket exactly once, no
+  // matter which shutdown path fires first. OpenCode can end a session several
+  // ways and they do not all reach the plugin the same way:
+  //   - the `dispose` plugin hook and the `*.disposed` events cover a graceful
+  //     exit (/exit, the app quitting),
+  //   - but a signal (Ctrl+C = SIGINT, `kill` = SIGTERM) tears the process down
+  //     without delivering either, which is why the status used to stay ACTIVE
+  //     after Ctrl+C. The process handlers below are the backstop for that.
+  // endSession is idempotent server-side, so racing paths are safe.
+  //
+  // Cap the shutdown wait so a stalled backend can't make Ctrl+C hang.
+  // endSession is best-effort: if the write can't land in this window, exit
+  // anyway rather than block the user.
+  const SHUTDOWN_FINALIZE_TIMEOUT_MS = 3000;
+  let finalized = false;
+  async function finalizeSession(reason: string): Promise<void> {
+    if (finalized) return;
+    finalized = true;
+    log(client, 'info', `[Vicoa] Finalizing session (${reason})`);
+    sessionWsClient.stop();
+    try {
+      await Promise.race([
+        vicoaClient.endSession(),
+        new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_FINALIZE_TIMEOUT_MS)),
+      ]);
+    } catch (error) {
+      log(client, 'warn', `[Vicoa] endSession during ${reason} failed: ${error}`);
+    }
+  }
+
+  // Signal backstop for the Ctrl+C / kill path. The plugin runs inside the
+  // OpenCode process, so these handlers are additive to OpenCode's own — Node
+  // runs every listener. We do NOT call process.exit(): OpenCode owns the exit,
+  // and forcing it here would cut off its own teardown. We only fire the
+  // COMPLETED write and let the normal exit proceed. Adding a listener does
+  // suppress Node's default "exit immediately on signal", but OpenCode installs
+  // its own signal handling that drives the real shutdown, so the process still
+  // exits; endSession is a sub-second REST call with its own timeout, so it
+  // does not meaningfully delay it.
+  const onSignal = (signal: NodeJS.Signals) => {
+    void finalizeSession(signal);
+  };
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
+  process.once('SIGHUP', onSignal);
+  // `beforeExit` fires on a natural event-loop drain (not on signals or
+  // process.exit), a final safety net if the process winds down without any of
+  // the above. It can run async work, unlike `exit`.
+  process.once('beforeExit', () => {
+    void finalizeSession('beforeExit');
+  });
 
   return {
+    dispose: async () => {
+      await finalizeSession('dispose');
+    },
     event: async ({ event }) => {
       try {
         switch (event.type) {
@@ -467,23 +650,37 @@ export const VicoaPlugin: Plugin = async (context) => {
           case 'message.updated': {
             const message = event.properties.info;
 
-            // User messages carry the agent the TUI used — track it so that
-            // cycleTuiToAgent knows where the indicator currently is.
-            // This is the only reliable signal for terminal-side agent changes
-            // (keybind cycles, /agent commands, etc.) because command.executed
-            // does not fire for TUI-dispatched commands.
-            if (message.role === 'user' && (message as any).agent) {
-              const reportedAgent = (message as any).agent as string;
-              const previousAgent = tuiCurrentAgent;
-              tuiCurrentAgent = reportedAgent;
-              preferredAgent = reportedAgent;
+            // User messages carry the agent and model the TUI used — track
+            // both so we can PATCH session_config on terminal-side changes
+            // (keybind cycles, /agent, model picker, etc.) without waiting
+            // for the app to send a control command.
+            if (message.role === 'user') {
+              // Agent/mode tracking
+              if ((message as any).agent) {
+                const reportedAgent = (message as any).agent as string;
+                const previousAgent = tuiCurrentAgent;
+                tuiCurrentAgent = reportedAgent;
+                preferredAgent = reportedAgent;
 
-              if (previousAgent !== reportedAgent) {
-                void sendAgentSwitchToUi(
-                  vicoaClient,
-                  (level, message) => log(client, level, message),
-                  reportedAgent,
-                );
+                if (previousAgent !== reportedAgent) {
+                  void sendAgentSwitchToUi(
+                    vicoaClient,
+                    (level, message) => log(client, level, message),
+                    reportedAgent,
+                  );
+                  void vicoaClient.patchSessionConfig({ agent: 'opencode', opencode_mode: reportedAgent });
+                }
+              }
+
+              // Model tracking — UserMessage.model = { providerID, modelID }
+              const msgModel = (message as any).model as { providerID?: string; modelID?: string } | undefined;
+              if (msgModel?.providerID && msgModel?.modelID) {
+                const modelSlug = `${msgModel.providerID}/${msgModel.modelID}`;
+                if (modelSlug !== currentTuiModel) {
+                  currentTuiModel = modelSlug;
+                  void vicoaClient.patchSessionConfig({ agent: 'opencode', model: modelSlug });
+                  log(client, 'info', `[Vicoa] TUI model synced to session_config: ${modelSlug}`);
+                }
               }
             }
 
@@ -506,16 +703,30 @@ export const VicoaPlugin: Plugin = async (context) => {
           // ── session lifecycle ─────────────────────────────────────
           case 'session.created': {
             const session = event.properties.info;
+
+            // A `task` subagent gets its own child session. Record it so its
+            // idle/status events can be told apart later, and leave the
+            // instance's own session tracking alone.
+            if (session.parentID) {
+              childSessionIds.add(session.id);
+              log(client, 'debug', `[Vicoa] Child session created: ${session.id} (parent ${session.parentID})`);
+              return;
+            }
+
             lastSessionTitle = session.title;
             currentSessionId = session.id;
             log(client, 'info', `[Vicoa] Session created: ${session.id}`);
 
-            await vicoaClient.updateStatus('ACTIVE');
+            await markActive(vicoaClient);
             return;
           }
 
           case 'session.updated': {
-            const nextTitle = event.properties.info.title;
+            const session = event.properties.info;
+            // Subagent sessions get their own titles — not the instance's name.
+            if (session.parentID) return;
+
+            const nextTitle = session.title;
             if (nextTitle && nextTitle !== lastSessionTitle) {
               lastSessionTitle = nextTitle;
               await vicoaClient.updateAgentInstanceName(nextTitle);
@@ -525,36 +736,59 @@ export const VicoaPlugin: Plugin = async (context) => {
           }
 
           case 'session.deleted': {
+            const session = event.properties.info;
+            // A finished subagent's session being cleaned up must not end the
+            // whole Vicoa session — endSession() is terminal and fires the
+            // terminate NOTIFY.
+            if (session.parentID || childSessionIds.has(session.id)) {
+              childSessionIds.delete(session.id);
+              return;
+            }
+
             currentSessionId = undefined;
             await vicoaClient.endSession();
             return;
           }
 
           case 'session.idle': {
-            log(client, 'info', '[Vicoa] Session idle');
-            await vicoaClient.updateStatus('AWAITING_INPUT');
-
-            if (vicoaClient.lastMessageId) {
-              await vicoaClient.requestUserInput(vicoaClient.lastMessageId);
+            const { sessionID } = event.properties;
+            if (isChildSession(sessionID)) {
+              log(client, 'debug', `[Vicoa] Ignoring idle from child session ${sessionID}`);
+              return;
             }
+
+            log(client, 'info', '[Vicoa] Session idle');
+            await settleAwaitingInput(vicoaClient);
             return;
           }
-          
+
           case 'session.status': {
-            const statusType = event.properties.status.type;
+            const { sessionID, status } = event.properties;
+            // A subagent going busy/idle says nothing about whether the user's
+            // session needs them.
+            if (isChildSession(sessionID)) return;
+
+            const statusType = status.type;
 
             // Track current status for interrupt handling
             currentSessionStatus = statusType;
 
             if (statusType === 'busy' || statusType === 'retry') {
-              await vicoaClient.updateStatus('ACTIVE');
+              await markActive(vicoaClient);
             } else if (statusType === 'idle') {
-              await vicoaClient.updateStatus('AWAITING_INPUT');
+              // Whichever of this and session.idle lands first settles the
+              // turn; the other is a no-op.
+              await settleAwaitingInput(vicoaClient);
             }
             return;
           }
 
           case 'session.error': {
+            // A subagent's error is the main session's problem to report (or
+            // recover from) — it must not settle the instance while the main
+            // session is still working.
+            if (isChildSession(event.properties.sessionID)) return;
+
             const errorObj = event.properties.error;
             const errorMsg = errorObj && typeof errorObj === 'object' && 'message' in errorObj
               ? String(errorObj.message)
@@ -620,18 +854,12 @@ export const VicoaPlugin: Plugin = async (context) => {
           }
 
           // ── shutdown ──────────────────────────────────────────────
-          // Fires before the process exits (/exit, app.exit, etc.).
-          // This is the only path where the event loop is still live,
-          // so async endSession() can actually complete.
+          // The graceful-exit events (/exit, app quitting). Signal-based
+          // teardown (Ctrl+C) does not emit these — the process signal
+          // handlers above cover that. finalizeSession dedupes across them.
           case 'server.instance.disposed' as string:
           case 'global.disposed' as string: {
-            log(client, 'info', `[Vicoa] ${event.type} — ending session`);
-            messagePoller.stop();
-            try {
-              await vicoaClient.endSession();
-            } catch (error) {
-              log(client, 'warn', `[Vicoa] endSession during dispose failed: ${error}`);
-            }
+            await finalizeSession(event.type);
             return;
           }
 

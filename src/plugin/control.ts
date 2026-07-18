@@ -12,6 +12,7 @@ type ControlCommandContext = {
   getTuiCurrentAgent: () => string | undefined;
   setTuiCurrentAgent: (agent: string | undefined) => void;
   setPreferredAgent: (agent: string | undefined) => void;
+  setTuiCurrentModel: (model: string | undefined) => void;
 };
 
 // Cycle the TUI's agent indicator to `targetAgent` by firing agent.cycle
@@ -81,10 +82,17 @@ function extractControlPayload(content: string): { setting?: string; value?: unk
 }
 
 /**
- * Handle control commands from Vicoa (matching Claude wrapper pattern)
+ * Handle control commands from Vicoa.
+ *
+ * Acknowledgements here are plain steps — never `requires_user_input`. That
+ * flag is the notification trigger server-side (it fans out push/email/SMS,
+ * and only defaults them off for plain steps), and the user just drove this
+ * action from the app: pinging their phone about it is noise. The status these
+ * acks want is applied by the caller instead, which follows a handled control
+ * command with a plain updateStatus('AWAITING_INPUT') write.
  */
 export async function handleControlCommand(content: string, context: ControlCommandContext): Promise<boolean> {
-  const { client, vicoaClient, currentSessionId, currentSessionStatus, getTuiCurrentAgent, setPreferredAgent, setTuiCurrentAgent } = context;
+  const { client, vicoaClient, currentSessionId, currentSessionStatus, getTuiCurrentAgent, setPreferredAgent, setTuiCurrentAgent, setTuiCurrentModel } = context;
 
   // Try to parse as JSON control command
   try {
@@ -164,7 +172,52 @@ export async function handleControlCommand(content: string, context: ControlComm
           setPreferredAgent(nextAgent);
         }
 
+        await vicoaClient.patchSessionConfig({ agent: 'opencode', opencode_mode: selectedAgent });
         await vicoaClient.sendMessage(`Agent changed to ${selectedAgent}.`);
+        return true;
+      }
+
+      if (setting === 'model') {
+        const modelValue = typeof value === 'string' ? value.trim() : '';
+        if (!modelValue) {
+          await vicoaClient.sendMessage('Invalid model: empty value.');
+          return true;
+        }
+
+        let canonicalModel = modelValue;
+        try {
+          const { data: providerData } = await client.provider.list();
+          const pd = providerData as {
+            all: Array<{ id: string; models: Record<string, { name: string }> }>;
+            connected: string[];
+          };
+          const connectedSet = new Set(pd.connected);
+          const allModels: Array<{ slug: string; name: string }> = [];
+          for (const provider of pd.all) {
+            if (!connectedSet.has(provider.id)) continue;
+            for (const [modelId, model] of Object.entries(provider.models)) {
+              allModels.push({ slug: `${provider.id}/${modelId}`, name: model.name });
+            }
+          }
+          const match = allModels.find(
+            (m) => m.slug === modelValue || m.slug.endsWith(`/${modelValue}`)
+          );
+          if (!match) {
+            const preview = allModels.slice(0, 10).map((m) => m.slug).join(', ');
+            await vicoaClient.sendMessage(
+              `Unknown model "${modelValue}". Available: ${preview}${allModels.length > 10 ? ` (+${allModels.length - 10} more)` : ''}.`
+            );
+            return true;
+          }
+          canonicalModel = match.slug;
+        } catch (error) {
+          log(client, 'warn', `[Vicoa] Could not list models for validation: ${error}`);
+        }
+
+        setTuiCurrentModel(canonicalModel);
+        await vicoaClient.patchSessionConfig({ agent: 'opencode', model: canonicalModel });
+        await vicoaClient.sendMessage(`Model changed to ${canonicalModel}.`);
+        log(client, 'info', `[Vicoa] Model changed to ${canonicalModel}`);
         return true;
       }
 
