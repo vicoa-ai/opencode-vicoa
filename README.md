@@ -17,12 +17,12 @@ OpenCode plugin for [Vicoa](https://vicoa.ai) to vibe code anywhere.
 
 This plugin works with Vicoa CLI, web, and mobile app. 
 
-## Installation vis Vicoa (Recommended)
+## Installation via Vicoa (Recommended)
 
 You can install `vicoa` CLI with:
 
 ```bash
-pip install vicoa
+npm i -g @vicoa/cli
 ``` 
 
 Then, run the following command to install the plugin and link Vicoa with OpenCode:
