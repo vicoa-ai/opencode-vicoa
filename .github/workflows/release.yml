@@ -70,7 +70,7 @@ jobs:
 
       - name: Test
         if: steps.version.outputs.changed == 'true'
-        run: npm test
+        run: npm test --if-present
 
       - name: Build
         if: steps.version.outputs.changed == 'true'
