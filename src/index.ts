@@ -43,7 +43,7 @@ import { formatProjectPath } from './plugin/path-utils.js';
  * Reported to the backend as the X-CLI-Version header on the session
  * WebSocket, which gates SSE/poll-transport retirement telemetry.
  */
-const PLUGIN_VERSION = '0.2.0';
+const PLUGIN_VERSION = '0.2.1';
 
 let lastSessionTitle: string | null = null;
 let currentSessionId: string | undefined;
