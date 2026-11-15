@@ -58,6 +58,7 @@ The plugin is organized into focused modules in `src/plugin/`:
 ### Plugin Lifecycle
 
 1. **Initialization**:
+   - Stays off unless this is the interactive TUI the user started themselves (`launch.ts`): not in the daemon's `opencode acp`, not in `run`/`serve`/`web`/`session list`, and not in any process started from a Vicoa session (`VICOA_AGENT_TYPE` / `VICOA_SPAWN_SOURCE` set). Such processes inherit the parent session's `VICOA_AGENT_INSTANCE_ID`, and registering there would take that session over and end it on exit
    - Loads Vicoa API key from credentials or environment
    - Registers agent instance with Vicoa backend
    - Syncs OpenCode slash commands to Vicoa dashboard
