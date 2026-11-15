@@ -35,6 +35,7 @@ import {
 } from './plugin/commands.js';
 import { handleControlCommand } from './plugin/control.js';
 import { log } from './plugin/utils.js';
+import { decideCurrentLaunch } from './plugin/launch.js';
 import { formatProjectPath } from './plugin/path-utils.js';
 
 /**
@@ -390,6 +391,15 @@ function startCommandSyncSubprogress(
 export const VicoaPlugin: Plugin = async (context) => {
   const { client, directory } = context;
 
+  // Only the TUI a person starts themselves becomes a Vicoa session. Anything
+  // else (the daemon's `opencode acp`, a command another agent runs) is left
+  // alone before it can register, so it never touches that session.
+  const launch = decideCurrentLaunch();
+  if (!launch.active) {
+    log(client, 'info', `[Vicoa v${PLUGIN_VERSION}] Inactive: ${launch.reason}`);
+    return {};
+  }
+
   // Get API key from environment or credentials file
   const apiKey = getApiKey();
   const baseUrl = process.env.VICOA_API_URL || process.env.VICOA_BASE_URL || 'https://agents.vicoa.ai';
@@ -402,7 +412,8 @@ export const VicoaPlugin: Plugin = async (context) => {
 
   log(client, 'info', `[Vicoa v${PLUGIN_VERSION}] Initializing...`);
 
-  // Generate or reuse agent instance ID
+  // Generate or reuse agent instance ID. After the launch check above, an id
+  // in the environment can only come from `vicoa opencode`.
   const agentInstanceId = process.env.VICOA_AGENT_INSTANCE_ID || randomUUID();
   const agentName = process.env.VICOA_AGENT_NAME || 'OpenCode';
 
