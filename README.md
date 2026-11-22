@@ -42,7 +42,7 @@ Add the plugin to OpenCode config (`~/.config/opencode/config.json`):
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": ["opencode-vicoa"]
+  "plugin": ["@vicoa/opencode"]
 }
 ```
 
@@ -75,7 +75,7 @@ npm run build
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": ["file://<path/to/opencode-vicoa/dist/index.js>"]
+  "plugin": ["file://<path/to/opencode-vicoa/dist/index.js>"]
 }
 ```
 
